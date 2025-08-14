@@ -1,0 +1,68 @@
+"use client";
+import { useEffect, useMemo, useState } from "react";
+import { bahData, type PayGradeBAH } from "@/utils/bahData";
+
+type Props = {
+  grade: PayGradeBAH | string;
+  depStatus: "with"|"without";
+  bahOn: boolean;
+  value?: number;
+  onChange: (next:{ bahOn:boolean; depStatus:"with"|"without"; bahCustom?:number; city?:string; mode?:"table"|"custom" })=>void;
+};
+
+const CITIES = Object.keys(bahData);
+
+export default function BAHPicker({ grade, depStatus, bahOn, value, onChange }: Props){
+  const [city, setCity] = useState<string>(CITIES[0]);
+  const [mode, setMode] = useState<"table"|"custom">("table");
+  const row = bahData[city]?.[grade as PayGradeBAH];
+
+  const tableValue = useMemo(()=>{
+    if (!row) return 0;
+    return depStatus==="with" ? row.withDependents : row.withoutDependents;
+  },[row,depStatus]);
+
+  const resolved = mode==="custom" ? (value ?? 0) : tableValue;
+
+  useEffect(()=>{
+    onChange({ bahOn, depStatus, bahCustom: resolved, city, mode });
+  },[resolved, bahOn, depStatus, city, mode]);
+
+  return (
+    <div className="space-y-2">
+      <label className="inline-flex items-center gap-2">
+        <input type="checkbox" checked={bahOn} onChange={e=>onChange({ bahOn:e.target.checked, depStatus, bahCustom: resolved, city, mode })}/>
+        Include BAH
+      </label>
+      <label className="inline-flex items-center gap-2 ml-4">
+        <input type="checkbox" checked={depStatus==="with"} onChange={e=>onChange({ bahOn, depStatus: e.target.checked?"with":"without", bahCustom: resolved, city, mode })}/>
+        With dependents
+      </label>
+
+      <div>
+        <label className="block text-sm">Locality</label>
+        <select className="w-full border rounded p-2" value={city} onChange={e=>setCity(e.target.value)}>
+          {CITIES.map(c => <option key={c} value={c}>{c}</option>)}
+        </select>
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button type="button" className={"px-3 py-1 border rounded "+(mode==="table"?"bg-gray-100":"")}
+          onClick={()=>setMode("table")}>Use table</button>
+        <button type="button" className={"px-3 py-1 border rounded "+(mode==="custom"?"bg-gray-100":"")}
+          onClick={()=>setMode("custom")}>Custom</button>
+      </div>
+
+      {mode==="custom"
+        ? (<div>
+            <label className="block text-sm">Custom BAH (monthly)</label>
+            <input className="w-full border rounded p-2" type="number" value={value ?? 0}
+              onChange={e=>onChange({ bahOn, depStatus, bahCustom: Number(e.target.value)||0, city, mode })}/>
+          </div>)
+        : (<p className="text-sm text-gray-600">Table value: <b>${tableValue.toLocaleString()}</b></p>)
+      }
+
+      <p className="text-xs text-gray-500">BAH is non‑taxable.</p>
+    </div>
+  );
+}

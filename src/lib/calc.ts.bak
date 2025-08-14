@@ -1,0 +1,153 @@
+import { getBasePayMonthly, type PayGrade } from "@/utils/basePayTable";
+import { BAS_2025 } from "@/utils/bas";
+import bahTop from "@/utils/bah_top100.json";
+
+/** Inputs used by /pay page (v1) */
+export type PayInputs = {
+  // identity
+  grade: PayGrade;
+  yos: number;
+
+  // BAS / BAH
+  basOn: boolean;
+  basType: "enlisted" | "officer";
+  bahOn: boolean;
+  depStatus: "with" | "without";
+  locationKey?: string;      // city key (when using table)
+  bahCustom?: number;        // if >0 overrides table value
+
+  // TSP
+  tspTraditionalPct: number; // % of base pay (0..100)
+  tspRothPct: number;        // % of base pay (0..100)
+
+  // Taxes (manual v1)
+  fedMonthly: number;        // user-entered monthly withholding
+  stateMonthly: number;      // user-entered monthly withholding
+
+  // Insurance / allotments
+  sgliAmount: number;        // coverage dollars (0..500000)
+  afrh: boolean;             // $0.50 if true
+  allot1: number;
+  allot2: number;
+  allot3: number;
+};
+
+export type CalcOutput = {
+  grossMonthly: number;
+  deductionsMonthly: number;       // per spec: Roth + FICA + Federal + State + SGLI + AFRH
+  netMonthlyExclAllot: number;     // Gross - Traditional TSP - Deductions
+  allotmentsMonthly: number;       // allot1+allot2+allot3
+  estSemiMonthlyPaycheck: number;  // (Net - Allotments) / 2
+  debug: {
+    baseMonthly: number;
+    basMonthly: number;
+    bahMonthly: number;
+    tsp: { traditionalAmt: number; rothAmt: number };
+    taxableForFITMonthly: number;  // Base - Traditional (BAS/BAH non-taxable)
+    fica: { ss: number; medicare: number; wagesMonthly: number };
+    insurance: { sgliCost: number; afrh: number };
+  };
+};
+
+// ---- constants (2025) ----
+const SS_ANNUAL_CAP = 168_600;            // Social Security cap (annual)
+const MEDICARE_ADDL_THRESHOLD = 200_000;  // Additional 0.9% over this (annual)
+
+const SS_RATE = 0.062;
+const MEDICARE_RATE = 0.0145;
+const MEDICARE_ADDL_RATE = 0.009;
+
+const MONTHLY_SS_CAP = SS_ANNUAL_CAP / 12;                    // 14,050.00
+const MONTHLY_MEDICARE_ADDL_THRESHOLD = MEDICARE_ADDL_THRESHOLD / 12; // 16,666.666...
+
+/** Resolve BAH (table or custom), respecting on/off + dep status */
+function resolveBAH(
+  on: boolean,
+  depStatus: "with" | "without",
+  locationKey?: string,
+  custom?: number
+): number {
+  if (!on) return 0;
+  if (custom && custom > 0) return custom;
+
+  if (locationKey && (bahTop as any)[locationKey]) {
+    const row = (bahTop as any)[locationKey];
+    return depStatus === "with" ? Number(row.withDep || 0) : Number(row.withoutDep || 0);
+  }
+  return 0;
+}
+
+/** SGLI: $0.05 per $1,000 of coverage + $1 (per spec). Clamp to 0..500k, step 50k */
+function computeSGLICost(coverageDollars: number): number {
+  const clamped = Math.max(0, Math.min(500_000, Math.round(coverageDollars / 50_000) * 50_000));
+  const perThousand = clamped / 1000;
+  return perThousand * 0.05 + (clamped > 0 ? 1 : 0);
+}
+
+/** Convert percent (0..100) * base to dollars, safe */
+function pctOfBase(baseMonthly: number, pct: number): number {
+  const p = Math.max(0, Number(pct) || 0) / 100;
+  return baseMonthly * p;
+}
+
+/** Main calculator */
+export function computePay(inputs: PayInputs): CalcOutput {
+  // 1) Core pays
+  const baseMonthly = getBasePayMonthly(inputs.grade, inputs.yos);
+  const basMonthly = inputs.basOn ? (inputs.basType === "officer" ? BAS_2025.officer : BAS_2025.enlisted) : 0;
+  const bahMonthly = resolveBAH(inputs.bahOn, inputs.depStatus, inputs.locationKey, inputs.bahCustom);
+
+  const grossMonthly = baseMonthly + basMonthly + bahMonthly;
+
+  // 2) TSP
+  const tspTraditionalAmt = pctOfBase(baseMonthly, inputs.tspTraditionalPct);
+  const tspRothAmt = pctOfBase(baseMonthly, inputs.tspRothPct);
+
+  // 3) FIT taxable wages (monthly) — per spec: Base - Traditional TSP
+  const taxableForFITMonthly = Math.max(0, baseMonthly - tspTraditionalAmt);
+
+  // 4) FICA (based on wages subject to FICA)
+  // TSP Traditional DOES NOT reduce FICA wages; BAS/BAH are excluded
+  const ficaWagesMonthly = baseMonthly;
+
+  const ssTax = SS_RATE * Math.min(ficaWagesMonthly, MONTHLY_SS_CAP);
+  const medicareRegular = MEDICARE_RATE * ficaWagesMonthly;
+  const medicareAddlBase = Math.max(0, ficaWagesMonthly - MONTHLY_MEDICARE_ADDL_THRESHOLD);
+  const medicareAddl = MEDICARE_ADDL_RATE * medicareAddlBase;
+  const medicareTax = medicareRegular + medicareAddl;
+
+  // 5) Insurance & fixed
+  const sgliCost = computeSGLICost(inputs.sgliAmount);
+  const afrhCost = inputs.afrh ? 0.5 : 0;
+
+  // 6) User-entered taxes
+  const fed = Math.max(0, Number(inputs.fedMonthly) || 0);
+  const state = Math.max(0, Number(inputs.stateMonthly) || 0);
+
+  // 7) Per-spec "Deductions (monthly)" (excludes Traditional TSP)
+  const deductionsMonthly = tspRothAmt + ssTax + medicareTax + fed + state + sgliCost + afrhCost;
+
+  // 8) Net (exclude allotments) — subtract Traditional TSP here so take‑home is right
+  const netMonthlyExclAllot = grossMonthly - tspTraditionalAmt - deductionsMonthly;
+
+  // 9) Allotments & paycheck estimate
+  const allotmentsMonthly = (Number(inputs.allot1) || 0) + (Number(inputs.allot2) || 0) + (Number(inputs.allot3) || 0);
+  const estSemiMonthlyPaycheck = (netMonthlyExclAllot - allotmentsMonthly) / 2;
+
+  return {
+    grossMonthly,
+    deductionsMonthly,
+    netMonthlyExclAllot,
+    allotmentsMonthly,
+    estSemiMonthlyPaycheck,
+    debug: {
+      baseMonthly,
+      basMonthly,
+      bahMonthly,
+      tsp: { traditionalAmt: tspTraditionalAmt, rothAmt: tspRothAmt },
+      taxableForFITMonthly,
+      fica: { ss: ssTax, medicare: medicareTax, wagesMonthly: ficaWagesMonthly },
+      insurance: { sgliCost, afrh: afrhCost },
+    },
+  };
+}
