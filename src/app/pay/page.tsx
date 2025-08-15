@@ -1,3 +1,6 @@
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 // src/app/pay/page.tsx
 "use client";
 
@@ -5,7 +8,11 @@ import React, { useEffect, useMemo, useState, useCallback } from "react";
 import { computePay, type PayInputs } from "@/lib/calc";
 import { makeBahOptions, type PayGradeBAH } from "@/utils/bahTop";
 
-const PAY_STORAGE_KEY = "navy-budget:payInputs:v1";
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Helpers                                                                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+const PAY_STORAGE_KEY = "navy-budget:payInputs:v2";
 
 const cx = (...xs: (string | false | undefined)[]) => xs.filter(Boolean).join(" ");
 const currency = (n: number) =>
@@ -24,7 +31,10 @@ function toBahGrade(grade: PayInputs["grade"]): PayGradeBAH {
 
 type Allot = { id: string; name: string; amount: number };
 
-// No borders: soft backgrounds + rounded corners.
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Styling tokens                                                            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
 const card =
   "rounded-2xl shadow-sm bg-white/80 backdrop-blur supports-[backdrop-filter]:bg-white/60";
 const label = "block text-sm font-medium text-slate-700";
@@ -37,6 +47,10 @@ const checkbox =
 const softBox = "rounded-xl p-4 bg-white/70";
 const pill = (from: string, to: string) =>
   `inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold text-white shadow bg-gradient-to-r ${from} ${to}`;
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Page                                                                      */
+/* ────────────────────────────────────────────────────────────────────────── */
 
 export default function PayPage() {
   const [hydrated, setHydrated] = useState(false);
@@ -84,6 +98,7 @@ export default function PayPage() {
     [inputs]
   );
 
+  /* Load & persist */
   useEffect(() => {
     setHydrated(true);
     try {
@@ -102,7 +117,7 @@ export default function PayPage() {
     } catch {}
   }, [inputs, hydrated]);
 
-  // ---------- BAH ----------
+  /* ---------- BAH ---------- */
   const bahGrade = toBahGrade(inputs.grade);
   const bahOptions = makeBahOptions(bahGrade); // {zip, name, withDep, withoutDep}
   const selectedBah = useMemo(
@@ -120,7 +135,7 @@ export default function PayPage() {
     return 0;
   }, [inputs, selectedBah]);
 
-  // ---------- Output ----------
+  /* ---------- Output ---------- */
   const tspTraditional = Number((inputs as any).tspTraditionalPercent || 0);
   const tspRoth = Number((inputs as any).tspRothPercent || 0);
   const tspTotal = Math.min(100, Math.max(0, tspTraditional + tspRoth));
@@ -149,15 +164,24 @@ export default function PayPage() {
     Number(out.tspMonthly || 0) +
     Number(out.insuranceMonthly || 0);
 
-  const allotTotal = Number(out.allotmentsMonthly || 0);
+  // Derive allotments from inputs so it always matches what the user entered,
+  // even if a build omits out.allotmentsMonthly.
+  const allotTotal = useMemo(() => {
+    const list = Array.isArray((inputs as any).allotments)
+      ? ((inputs as any).allotments as { amount?: number }[])
+      : [];
+    return list.reduce((sum, a) => sum + Number(a?.amount || 0), 0);
+  }, [inputs]);
 
-  // ✅ Net pay NOW EXCLUDES allotments:
+  // Net pay EXCLUDES allotments (for monthly net figure)
   const netBeforeAllot = Number(out.netMonthlyExclAllot || gross - deductions);
-  const perPaycheck = netBeforeAllot / 2; // twice-monthly assumption
 
-  // ---------- Handlers ----------
-  const set = useCallback(<K extends string>(k: K, v: any) => {
-    setInputs((prev) => ({ ...prev, [k]: v }));
+  // Per paycheck should reflect allotments (twice-monthly)
+  const perPaycheckAfterAllot = Math.max(0, (netBeforeAllot - allotTotal) / 2);
+
+  /* ---------- Handlers ---------- */
+  const set = useCallback<<K extends string>(k: K, v: any) => void>((k, v) => {
+    setInputs((prev) => ({ ...prev, [k]: v } as PayInputs));
   }, []);
 
   const updateAllot = (id: string, field: "name" | "amount", val: string) => {
@@ -173,6 +197,7 @@ export default function PayPage() {
       return { ...prev, allotments: next } as PayInputs;
     });
   };
+
   const addAllot = () =>
     setInputs((prev) => ({
       ...prev,
@@ -181,6 +206,7 @@ export default function PayPage() {
         { id: makeId(), name: "", amount: 0 },
       ],
     })) as any;
+
   const removeAllot = (id: string) =>
     setInputs((prev) => ({
       ...prev,
@@ -190,7 +216,7 @@ export default function PayPage() {
       ).filter((a: Allot) => a.id !== id),
     })) as any;
 
-  // ---------- UI ----------
+  /* ---------- UI ---------- */
   return (
     <div className="min-h-screen bg-gradient-to-br from-sky-50 via-indigo-50 to-emerald-50">
       <main className="max-w-5xl mx-auto p-6 space-y-6">
@@ -538,7 +564,7 @@ export default function PayPage() {
           </div>
         </section>
 
-        {/* SUMMARY (compact with dropdowns) */}
+        {/* SUMMARY */}
         <section className={cx(card, "p-5")}>
           <div className={pill("from-indigo-500", "to-purple-500")}>Summary</div>
 
@@ -626,7 +652,7 @@ export default function PayPage() {
                 <span className="font-semibold tabular-nums">{currency(allotTotal)}</span>
               </button>
               {openAllot && (
-                <div className="mt-2 space-y-1">
+                <div className="mt-2">
                   {allotments.length === 0 && (
                     <div className="text-slate-500">No allotments</div>
                   )}
@@ -640,7 +666,7 @@ export default function PayPage() {
               )}
             </div>
 
-            {/* Net Pay (EXCLUDES allotments) */}
+            {/* Net Pay */}
             <div className={softBox}>
               <button
                 type="button"
@@ -648,17 +674,20 @@ export default function PayPage() {
                 className="w-full flex items-center justify-between"
               >
                 <span className="font-semibold text-slate-700">Net Pay</span>
-                <span className="font-semibold tabular-nums text-emerald-700">{currency(netBeforeAllot)}</span>
+                {/* Monthly net (excl. allotments) shown as the headline */}
+                <span className="font-semibold tabular-nums text-emerald-700">
+                  {currency(netBeforeAllot)}
+                </span>
               </button>
               {openNet && (
                 <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-500">Monthly Net</span>
+                    <span className="text-slate-500">Monthly Net (excl. allotments)</span>
                     <span className="tabular-nums">{currency(netBeforeAllot)}</span>
                   </div>
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-500">Per Paycheck (twice‑monthly)</span>
-                    <span className="tabular-nums">{currency(perPaycheck)}</span>
+                    <span className="text-slate-500">Per Paycheck (after allotments)</span>
+                    <span className="tabular-nums">{currency(perPaycheckAfterAllot)}</span>
                   </div>
                 </div>
               )}

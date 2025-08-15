@@ -1,10 +1,14 @@
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
+// src/app/budget/page.tsx
 "use client";
 
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  computeSnapshotFromStorage,
+  computePay,
+  type PayInputs,
   type WithOrWithout,
-  type BudgetSnapshot,
 } from "@/lib/calc";
 import { makeBahOptions, type PayGradeBAH } from "@/utils/bahTop";
 import { ResponsiveContainer, PieChart, Pie, Cell, Tooltip } from "recharts";
@@ -27,7 +31,7 @@ const selectBase =
 const pill = (from: string, to: string) =>
   `inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold text-white shadow bg-gradient-to-r ${from} ${to}`;
 
-const BUDGET_STORAGE_KEY = "navy-budget:budget:v1";
+const BUDGET_STORAGE_KEY = "navy-budget:budget:v2";
 const PAY_STORAGE_KEY = "navy-budget:payInputs:v1";
 
 /* =========================
@@ -46,14 +50,14 @@ const PALETTE = [
 ];
 
 function toBahGrade(grade: string): PayGradeBAH {
-  if (["E1","E2","E3","E4"].includes(grade)) return "E1–E4";
+  if (["E1", "E2", "E3", "E4"].includes(grade)) return "E1–E4";
   if (
     ["E5","E6","E7","E8","E9","W1","W2","W3","W4","W5","O1","O2","O3","O4","O5","O6"].includes(grade)
   ) return grade as PayGradeBAH;
   return "O6";
 }
 
-function resolveBahForBudget(
+function resolveBah(
   grade: string,
   dep: WithOrWithout,
   bahZip: string,
@@ -61,8 +65,7 @@ function resolveBahForBudget(
 ): number {
   if (bahZip === "custom") return Math.max(0, Number(custom || 0));
   if (!bahZip) return 0;
-  const bahGrade = toBahGrade(grade);
-  const opts = makeBahOptions(bahGrade);
+  const opts = makeBahOptions(toBahGrade(grade));
   const found = opts.find((o) => o.zip === bahZip);
   if (!found) return 0;
   return dep === "with" ? found.withDep : found.withoutDep;
@@ -87,6 +90,89 @@ function stripNonAllotments(list: Expense[]): Expense[] {
   return list.filter((e) => !BAD.test(String(e.name || "")));
 }
 
+const sumTspPercent = (obj: any) =>
+  Math.min(
+    100,
+    Math.max(
+      0,
+      Number(obj?.tspTraditionalPercent || 0) + Number(obj?.tspRothPercent || 0)
+    )
+  );
+
+/** Compute Monthly Net (EXCLUDES allotments) straight from Pay inputs in localStorage. */
+function computeMonthlyNetFromPay(): number {
+  try {
+    const raw = window.localStorage.getItem(PAY_STORAGE_KEY);
+    if (!raw) return 0;
+
+    const pay = JSON.parse(raw) as Partial<PayInputs> & {
+      bahOn?: boolean;
+      basOn?: boolean;
+      depStatus?: "with" | "without";
+      bahZip?: string;
+      bahCustom?: number;
+      tspTraditionalPercent?: number;
+      tspRothPercent?: number;
+      specialOn?: boolean;
+      specialAmount?: number;
+      federalMonthly?: number;
+      stateMonthly?: number;
+      sgliOn?: boolean;
+      sgliCoverage?: number;
+      afrh?: boolean;
+      yos?: number;
+      grade?: any;
+    };
+
+    const grade = String(pay.grade || "E1");
+    const tableBah = resolveBah(
+      grade,
+      (pay.depStatus as WithOrWithout) || "with",
+      String(pay.bahZip || ""),
+      Number(pay.bahCustom || 0)
+    );
+
+    const inputsForCalc: PayInputs = {
+      grade: grade as any,
+      yos: Number((pay as any).yos || 0),
+      bahOn: !!pay.bahOn,
+      depStatus: (pay.depStatus as any) || "with",
+      bahZip: String(pay.bahZip || ""),
+      bahCustom: Number(pay.bahCustom || 0),
+      tspPercent: sumTspPercent(pay),
+      federalMonthly: Number(pay.federalMonthly || 0),
+      stateMonthly: Number(pay.stateMonthly || 0),
+      sgliOn: !!pay.sgliOn,
+      sgliCoverage: Number(pay.sgliCoverage || 0),
+      afrh: !!pay.afrh,
+    } as PayInputs;
+
+    const extras = {
+      basOn: !!pay.basOn,
+      specialMonthly: pay.specialOn ? Math.max(0, Number(pay.specialAmount || 0)) : 0,
+    };
+
+    const out = computePay(inputsForCalc, tableBah, extras);
+
+    const gross =
+      Number(out.totalEntitlements || 0);
+
+    const deductions =
+      Number(out.federalMonthly || 0) +
+      Number(out.stateMonthly || 0) +
+      Number(out.ficaSocialMonthly || 0) +
+      Number(out.ficaMedicareMonthly || 0) +
+      Number(out.tspMonthly || 0) +
+      Number(out.insuranceMonthly || 0);
+
+    // ✅ Net (EXCLUDES allotments)
+    const netExclAllot = Math.max(0, gross - deductions);
+    return netExclAllot || 0;
+  } catch {
+    return 0;
+  }
+}
+
 /* =========================
    Component
 ========================= */
@@ -96,7 +182,7 @@ export default function BudgetPage() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [importedOnce, setImportedOnce] = useState(false);
   const [migrated, setMigrated] = useState(false); // run cleaner once
-  const [incomeSnap, setIncomeSnap] = useState<BudgetSnapshot | null>(null);
+  const [incomeMonthlyNet, setIncomeMonthlyNet] = useState<number>(0);
 
   // Ensure every expense has a color
   const ensureColors = useCallback((list: Expense[]) => {
@@ -131,10 +217,19 @@ export default function BudgetPage() {
     } catch {}
   }, [ensureColors]);
 
-  /* Income snapshot ONLY for totals; no expense import from it */
+  /* Always compute Net Monthly directly from PAY storage */
   useEffect(() => {
     if (!hydrated) return;
-    setIncomeSnap(computeSnapshotFromStorage(resolveBahForBudget) || null);
+    setIncomeMonthlyNet(computeMonthlyNetFromPay());
+
+    // Keep in sync if Pay page updates in another tab
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === PAY_STORAGE_KEY) {
+        setIncomeMonthlyNet(computeMonthlyNetFromPay());
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, [hydrated]);
 
   /* One-time migration: strip any old FICA/Tax/Insurance lines that were cached */
@@ -251,7 +346,6 @@ export default function BudgetPage() {
     setExpenses((prev) => prev.filter((e) => e.id !== id));
 
   const importFromPayAllotmentsOnly = () => {
-    // Clear current and import ONLY allotments
     const payAllots = readPayAllotments()
       .map((a, i) => ({
         id: makeId(),
@@ -267,8 +361,7 @@ export default function BudgetPage() {
     setMigrated(true);
   };
 
-  const incomeMonthly = incomeSnap?.totals.incomeMonthly ?? 0;
-  const netAfterExpenses = incomeMonthly - totalExpenses;
+  const netAfterExpenses = (incomeMonthlyNet || 0) - (totalExpenses || 0);
 
   /* =========================
      UI
@@ -352,16 +445,6 @@ export default function BudgetPage() {
         <section className={cx(card, "p-5")}>
           <div className={pill("from-amber-500", "to-yellow-500")}>Expenses</div>
 
-          <div className="flex items-center justify-end mt-3">
-            <button
-              type="button"
-              onClick={addExpense}
-              className="px-3 py-1.5 rounded-lg shadow-sm text-sm bg-white/80 hover:bg-white"
-            >
-              + Add Expense
-            </button>
-          </div>
-
           <div className="space-y-3 mt-3">
             {expenses.map((e, idx) => (
               <div
@@ -430,6 +513,7 @@ export default function BudgetPage() {
             )}
           </div>
 
+          {/* Totals */}
           <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
             <div className={softBox}>
               <div className="text-slate-500 text-sm">Total Expenses</div>
@@ -446,6 +530,17 @@ export default function BudgetPage() {
               </div>
             </div>
           </div>
+
+          {/* + Add Expense at bottom */}
+          <div className="flex items-center justify-end mt-4">
+            <button
+              type="button"
+              onClick={addExpense}
+              className="px-3 py-1.5 rounded-lg shadow-sm text-sm bg-white/80 hover:bg-white"
+            >
+              + Add Expense
+            </button>
+          </div>
         </section>
 
         {/* INCOME (BOTTOM) */}
@@ -454,9 +549,9 @@ export default function BudgetPage() {
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
             <div className={softBox}>
-              <div className="text-slate-500 text-sm">Income Monthly</div>
+              <div className="text-slate-500 text-sm">Income Monthly (Net)</div>
               <div className="text-xl font-semibold">
-                {currency(incomeMonthly)}
+                {hydrated ? currency(incomeMonthlyNet) : "—"}
               </div>
             </div>
             <div className={softBox}>
@@ -468,7 +563,7 @@ export default function BudgetPage() {
             <div className={softBox}>
               <div className="text-slate-500 text-sm">Net After Expenses</div>
               <div className="text-xl font-semibold text-emerald-700">
-                {currency(netAfterExpenses)}
+                {hydrated ? currency((incomeMonthlyNet || 0) - (totalExpenses || 0)) : "—"}
               </div>
             </div>
           </div>
